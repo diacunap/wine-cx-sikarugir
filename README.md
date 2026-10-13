@@ -100,10 +100,6 @@ Probado con Battle.net 2.53 + Diablo II: Resurrected en un M4, macOS 27, Sikarug
 En `config.sh`, cambia `CX_VERSION` y `CX_SHA256` (la checksum del tarball en
 <https://media.codeweavers.com/pub/crossover/source/>) y vuelve a correr `./build.sh`.
 
-## Compilar en GitHub en vez de tu Mac
-
-`.github/workflows/build.yml` hace lo mismo en un runner macOS ARM de GitHub (Actions → build-engine → Run workflow). Es gratis solo en repos **públicos**. El runner trae ~14 GB de disco, así que puede quedar corto.
-
 ## Qué se cambió del original
 
 Los scripts de build vienen de [steamplay-mac](https://github.com/thedankest/steamplay-mac) (GPL-3.0, por eso este repo también es GPL-3.0). Se les sacó todo lo de Steam (lsteamclient, NotProton, steam.exe), las fuentes van **sin parches extra** (lo mismo que trae CrossOver) y se agregó el empaquetado en formato de engine de Sikarugir (`wswine.bundle`).
