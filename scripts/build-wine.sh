@@ -82,9 +82,9 @@ rm -rf "$INSTALL"
 make install-lib
 ln -sf ../lib/wine/x86_64-unix/wine "$INSTALL/bin/wine"
 
-# The point of this whole build: CodeWeavers' hacks must be in. Fail loudly if not.
-for knob in WINE_SIMULATE_WRITECOPY CX_APPLEGPTK_LIBD3DSHARED_PATH; do
+# The point of this whole build: CodeWeavers' hacks (and our renderer-path patch) must be in.
+for knob in WINE_SIMULATE_WRITECOPY CX_APPLEGPTK_LIBD3DSHARED_PATH WINEDLLPATH_D3DMETAL; do
     grep -qa "$knob" "$INSTALL/lib/wine/x86_64-unix/ntdll.so" \
-        || { echo "ntdll.so lacks $knob: not a CrossOver-patched build?" >&2; exit 1; }
+        || { echo "ntdll.so lacks $knob: missing CrossOver sources or patches/?" >&2; exit 1; }
 done
 echo "wine installed at $INSTALL"

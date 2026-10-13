@@ -7,7 +7,7 @@ CX_SHA256=ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872
 CX_URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-${CX_VERSION}.tar.gz"
 
 # Engine revision for this CX_VERSION (bump when you rebuild with changes, same CX version).
-ENGINE_REV=1
+ENGINE_REV=2
 
 # Sikarugir engine naming: WS12Wine<Name>.tar.xz (WS12 = Wineskin 12 wrapper format).
 ENGINE_NAME="WS12WineCX${CX_VERSION%.0}_${ENGINE_REV}"

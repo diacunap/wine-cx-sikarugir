@@ -4,3 +4,4 @@ build/
 dist/
 HANDOFF.md
 .DS_Store
+build-run.log

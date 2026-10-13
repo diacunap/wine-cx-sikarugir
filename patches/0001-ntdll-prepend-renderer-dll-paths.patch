@@ -1,0 +1,49 @@
+--- a/dlls/ntdll/unix/loader.c	2026-10-12 21:47:11
++++ b/dlls/ntdll/unix/loader.c	2026-10-12 21:47:22
+@@ -382,18 +382,44 @@
+     dll_paths = new_dll_paths;
+     if (path_len > dll_path_maxlen)
+         dll_path_maxlen = path_len;
++}
++
++/* Sikarugir: renderer DLL dirs (D3DMetal, DXMT, DXVK...) that must win over the
++ * engine's own builtins. The wrapper exports them; CrossOver does this in its
++ * closed-source cxcompatdb.so (CW Hack 24067), which the LGPL drop doesn't have. */
++static const char * const prepend_vars[] =
++{
++    "WINEDLLPATH_PREPEND", "WINEDLLPATH_D3DMETAL", "WINEDLLPATH_DXMT",
++    "WINEDLLPATH_DXVK", "WINEDLLPATH_D9VK", "WINEDLLPATH_CNCD",
++};
++
++static int count_path_entries( const char *path )
++{
++    int count = 1;
++    if (!path || !*path) return 0;
++    for (; *path; path++) if (*path == ':') count++;
++    return count;
+ }
+ 
+ static void set_dll_path(void)
+ {
+     char *p, *path = getenv( "WINEDLLPATH" );
+-    int i, count = 0;
++    int i, count = count_path_entries( path );
+ 
+-    if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    for (i = 0; i < ARRAY_SIZE(prepend_vars); i++) count += count_path_entries( getenv( prepend_vars[i] ));
+ 
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
+ 
++    for (i = 0; i < ARRAY_SIZE(prepend_vars); i++)
++    {
++        char *pre = getenv( prepend_vars[i] );
++        if (!pre || !*pre) continue;
++        pre = strdup( pre );
++        for (p = strtok( pre, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( pre );
++    }
++
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
