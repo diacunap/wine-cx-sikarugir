@@ -1,0 +1,57 @@
+# Builds the engine on GitHub's Apple Silicon runners and publishes it as a Release.
+# Free on PUBLIC repos (macOS minutes cost 10x on private ones).
+# Runs when the build inputs change on main, or by hand (Actions -> build-engine -> Run workflow).
+# The runner has ~14 GB of disk, which is tight: ccache is disabled.
+name: build-engine
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - build.sh
+      - config.sh
+      - scripts/**
+      - .github/workflows/build.yml
+concurrency:
+  group: build-engine
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: |
+          sudo rm -rf /Applications/Xcode_*beta* ~/Library/Android /usr/local/share/dotnet || true
+          df -h /
+      - name: Homebrew deps
+        run: brew install mingw-w64 bison flex ninja cmake pkgconf autoconf automake libtool llvm lld nasm freetype
+      - name: Build
+        env:
+          NO_CCACHE: "1"
+          MIN_FREE_GB: "10"
+        run: ./build.sh
+      - name: Logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: build/logs/
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source config.sh
+          TAG="$ENGINE_NAME"
+          FILE="dist/$ENGINE_NAME.tar.xz"
+          shasum -a 256 "$FILE" | sed 's|dist/||' > "$FILE.sha256"
+          NOTES="Built from the CrossOver $CX_VERSION sources at commit $GITHUB_SHA. Install: copy the .tar.xz to ~/Library/Application Support/Sikarugir/Engines/"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FILE" "$FILE.sha256" --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$FILE" "$FILE.sha256" --title "$ENGINE_NAME" --notes "$NOTES"
+          fi

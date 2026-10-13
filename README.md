@@ -31,6 +31,13 @@ El engine **no trae D3DMetal ni DXMT**: esos los pone el wrapper de Sikarugir (`
 
 Si un paso falla, `build.sh` muestra las últimas líneas del log. Al volver a correrlo, los pasos que ya terminaron se saltan.
 
+## Sin compilar: bajar el engine de Releases
+
+GitHub Actions compila el engine en un runner macOS ARM cada vez que cambian `build.sh`,
+`config.sh` o `scripts/` en `main` (o a mano: Actions → build-engine → Run workflow) y lo publica
+en [Releases](../../releases) con su `.sha256`. Bajas el `.tar.xz`, lo copias a
+`~/Library/Application Support/Sikarugir/Engines/` y listo. Gratis porque el repo es público.
+
 ## Configurar el wrapper (Battle.net / D2R)
 
 Probado con Battle.net 2.53 + Diablo II: Resurrected en un M4, macOS 27, Sikarugir template 1.0.21.
