@@ -1,0 +1,6 @@
+downloads/
+sources/
+build/
+dist/
+HANDOFF.md
+.DS_Store
