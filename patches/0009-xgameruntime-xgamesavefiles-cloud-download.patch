@@ -1,0 +1,496 @@
+--- a/dlls/xgameruntime/xgamesave.c
++++ b/dlls/xgameruntime/xgamesave.c
+@@ -1403,8 +1403,8 @@
+     char *folder;
+ };
+ 
+-/* XGameSaveFiles: a plain per-user, per-config folder the title writes files into.
+- * Local only for now (no titlestorage sync), next to the XGameSave container root. */
++/* XGameSaveFiles: a plain per-user, per-config folder the title writes files into,
++ * next to the XGameSave container root. Cloud sync is download-only, see files_cloud_download(). */
+ static HRESULT files_folder( XUserHandle user, const char *configurationId, char **out )
+ {
+     char localAppData[MAX_PATH], scid[128], *folder;
+@@ -1418,8 +1418,468 @@
+     TRACE( "user %p, configurationId %s -> %s.\n", user, debugstr_a( configurationId ), debugstr_a( folder ) );
+     *out = folder;
+     return S_OK;
++}
++
++/* XGameSaveFiles cloud sync, DOWNLOAD ONLY.
++ *
++ * On Windows, Gaming Services maps every connected storage container of the scid to a
++ * directory of the XGameSaveFiles folder (container "a/b" <-> dir "a\b") and every blob
++ * of that container to a file in that directory (xodus docs/xbox/titlestorage.md,
++ * "XGameSaveFiles"). Here we list the containers (GET /), and for each container that is
++ * missing locally, or whose clientFileTime is newer than the newest local file of its
++ * directory, we download its blobs (GET /<container>,savedgame, GET /<atom>) and write
++ * them as files. Before the first write the whole folder is copied to files.bak-<time>.
++ *
++ * This code must never modify the cloud: its only network call is files_cloud_get(),
++ * which is hardcoded to GET. Nothing here is ever deleted, locally or remotely.
++ * XODUS_SAVE_SYNC=off disables it, =download overwrites every container that exists in
++ * the cloud (after the backup), =upload is not supported for XGameSaveFiles (no-op). */
++
++enum files_sync_mode
++{
++    FILES_SYNC_AUTO,
++    FILES_SYNC_FORCE_DOWNLOAD,
++    FILES_SYNC_OFF,
++};
++
++struct files_remote
++{
++    char *name;
++    char *time;
++};
++
++struct files_blob
++{
++    char *name;
++    BYTE *data;
++    SIZE_T size;
++};
++
++static enum files_sync_mode files_sync_mode( void )
++{
++    char value[32];
++    if (!GetEnvironmentVariableA( "XODUS_SAVE_SYNC", value, sizeof(value) )) return FILES_SYNC_AUTO;
++    if (!_stricmp( value, "off" )) return FILES_SYNC_OFF;
++    if (!_stricmp( value, "download" )) return FILES_SYNC_FORCE_DOWNLOAD;
++    if (!_stricmp( value, "upload" ))
++    {
++        WARN( "XODUS_SAVE_SYNC=upload is not supported for XGameSaveFiles, skipping cloud sync.\n" );
++        return FILES_SYNC_OFF;
++    }
++    return FILES_SYNC_AUTO;
+ }
+ 
++static BOOL files_verbose( void )
++{
++    return GetEnvironmentVariableA( "XODUS_SAVE_SYNC", NULL, 0 ) != 0;
++}
++
++/* The only network access of the XGameSaveFiles sync. Read-only by construction. */
++static HRESULT files_cloud_get( struct XGameSaveProvider *cloud, const char *path, DWORD *status, BYTE **buffer, SIZE_T *size )
++{
++    *buffer = NULL;
++    *size = 0;
++    return cloud_request( cloud, "GET", path, NULL, NULL, 0, status, buffer, size );
++}
++
++/* One path component: no separators, no reserved characters, not "." / "..", no trailing dot or space. */
++static BOOL files_valid_component( const char *str, SIZE_T len )
++{
++    if (!len || len > 255) return FALSE;
++    if (str[0] == '.' && (len == 1 || (len == 2 && str[1] == '.'))) return FALSE;
++    if (str[len - 1] == '.' || str[len - 1] == ' ') return FALSE;
++    for (SIZE_T i = 0; i < len; i++)
++    {
++        BYTE c = str[i];
++        if (c < 0x20 || c == 0x7f || strchr( "\\/:*?\"<>|", c )) return FALSE;
++    }
++    return TRUE;
++}
++
++/* Container "a/b" -> "<folder>\a\b". Refuses anything that could escape the folder. */
++static BOOL files_container_dir( const char *folder, const char *name, char *out, SIZE_T size )
++{
++    const char *p = name, *slash;
++    SIZE_T len = snprintf( out, size, "%s", folder );
++
++    if (!*name || *name == '/') return FALSE;
++    for (;;)
++    {
++        SIZE_T part;
++        slash = strchr( p, '/' );
++        part = slash ? (SIZE_T)(slash - p) : strlen( p );
++        if (!files_valid_component( p, part )) return FALSE;
++        if (len + 1 + part + 1 > size) return FALSE;
++        out[len++] = '\\';
++        memcpy( out + len, p, part );
++        len += part;
++        out[len] = 0;
++        if (!slash) break;
++        p = slash + 1;
++    }
++    /* leave room for "\<blob>.tmp" in write_file() */
++    return len + 80 < MAX_PATH;
++}
++
++/* Newest last-write time (unix seconds) of the files directly inside dir. FALSE if it has no files. */
++static BOOL files_local_newest( const char *dir, UINT64 *newest )
++{
++    char pattern[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++    BOOL found = FALSE;
++
++    *newest = 0;
++    snprintf( pattern, sizeof(pattern), "%s\\*", dir );
++    if ((find = FindFirstFileA( pattern, &data )) == INVALID_HANDLE_VALUE) return FALSE;
++    do
++    {
++        UINT64 time;
++        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++        found = TRUE;
++        if ((time = filetime_to_unix( &data.ftLastWriteTime )) > *newest) *newest = time;
++    } while (FindNextFileA( find, &data ));
++    FindClose( find );
++    return found;
++}
++
++static BOOL files_folder_has_content( const char *folder )
++{
++    char pattern[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++    BOOL found = FALSE;
++
++    snprintf( pattern, sizeof(pattern), "%s\\*", folder );
++    if ((find = FindFirstFileA( pattern, &data )) == INVALID_HANDLE_VALUE) return FALSE;
++    do found = strcmp( data.cFileName, "." ) && strcmp( data.cFileName, ".." );
++    while (!found && FindNextFileA( find, &data ));
++    FindClose( find );
++    return found;
++}
++
++/* Recursive copy; fails (and the caller writes nothing) if any entry could not be copied. */
++static BOOL files_copy_tree( const char *src, const char *dst )
++{
++    char pattern[MAX_PATH], from[MAX_PATH], to[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++    BOOL ok = TRUE;
++
++    if (!CreateDirectoryA( dst, NULL )) return FALSE;
++    snprintf( pattern, sizeof(pattern), "%s\\*", src );
++    if ((find = FindFirstFileA( pattern, &data )) == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
++    do
++    {
++        if (!strcmp( data.cFileName, "." ) || !strcmp( data.cFileName, ".." )) continue;
++        if (snprintf( from, sizeof(from), "%s\\%s", src, data.cFileName ) >= sizeof(from) ||
++            snprintf( to, sizeof(to), "%s\\%s", dst, data.cFileName ) >= sizeof(to))
++            ok = FALSE;
++        else if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = files_copy_tree( from, to );
++        else if (!(ok = CopyFileA( from, to, TRUE ))) ERR( "backup: could not copy %s, error %lu.\n", debugstr_a( from ), GetLastError() );
++    } while (ok && FindNextFileA( find, &data ));
++    FindClose( find );
++    return ok;
++}
++
++/* Copy folder to a new sibling "<folder>.bak-YYYYmmdd-HHMMSS[-n]". Never overwrites an existing backup. */
++static BOOL files_backup( const char *folder, char *backup, SIZE_T size )
++{
++    SYSTEMTIME st;
++    int len;
++
++    GetLocalTime( &st );
++    len = snprintf( backup, size, "%s.bak-%04u%02u%02u-%02u%02u%02u", folder, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond );
++    if (len < 0 || len + 4 >= size) return FALSE;
++    for (int i = 1; GetFileAttributesA( backup ) != INVALID_FILE_ATTRIBUTES; i++)
++    {
++        if (i > 99) return FALSE;
++        snprintf( backup + len, size - len, "-%d", i );
++    }
++    return files_copy_tree( folder, backup );
++}
++
++static void files_free_blobs( struct files_blob *blobs, UINT32 count )
++{
++    for (UINT32 i = 0; i < count; i++)
++    {
++        free( blobs[i].name );
++        free( blobs[i].data );
++    }
++    free( blobs );
++}
++
++/* Fetch every blob of a container into memory. Nothing is written unless all of them were downloaded. */
++static HRESULT files_fetch_container( struct XGameSaveProvider *cloud, const char *name, struct files_blob **out, UINT32 *outCount )
++{
++    struct files_blob *blobs = NULL, *tmp;
++    char path[1024], *enc, *key;
++    const char *atoms, *value;
++    UINT32 count = 0;
++    SIZE_T size;
++    BYTE *buffer;
++    DWORD status;
++    HRESULT hr;
++
++    *out = NULL;
++    *outCount = 0;
++    if (!(enc = url_encode( name ))) return E_OUTOFMEMORY;
++    snprintf( path, sizeof(path), "/%s,savedgame", enc );
++    free( enc );
++    if (FAILED(hr = files_cloud_get( cloud, path, &status, &buffer, &size ))) return hr;
++    if (status != 200 || !buffer || !(atoms = json_find( (char *)buffer, "atoms" )) || *atoms != '{')
++    {
++        free( buffer );
++        return E_FAIL;
++    }
++
++    while (SUCCEEDED(hr) && json_object_next( &atoms, &key, &value ))
++    {
++        char *atom = NULL;
++        BYTE *data = NULL;
++        SIZE_T dataSize = 0;
++
++        if (*value == '"') json_string( value, &atom );
++        if (!atom || !files_valid_component( key, strlen( key ) ) || strlen( key ) > 200)
++        {
++            WARN( "container %s: unusable blob name %s or atom, skipping the whole container.\n", debugstr_a( name ), debugstr_a( key ) );
++            hr = E_FAIL;
++        }
++        else if (!(tmp = realloc( blobs, (count + 1) * sizeof(*blobs) ))) hr = E_OUTOFMEMORY;
++        else
++        {
++            blobs = tmp;
++            snprintf( path, sizeof(path), "/%s", atom );
++            if (SUCCEEDED(hr = files_cloud_get( cloud, path, &status, &data, &dataSize )) && status != 200) hr = E_FAIL;
++            if (SUCCEEDED(hr))
++            {
++                blobs[count].name = key;
++                blobs[count].data = data;
++                blobs[count].size = dataSize;
++                count++;
++                key = NULL;
++                data = NULL;
++            }
++        }
++        free( data );
++        free( atom );
++        free( key );
++    }
++    free( buffer );
++    if (FAILED(hr))
++    {
++        files_free_blobs( blobs, count );
++        return hr;
++    }
++    *out = blobs;
++    *outCount = count;
++    return S_OK;
++}
++
++static HRESULT files_list_remote( struct XGameSaveProvider *cloud, struct files_remote **out, UINT32 *outCount )
++{
++    struct files_remote *remote = NULL, *tmp;
++    const char *blobs, *item, *paging;
++    UINT32 count = 0;
++    SIZE_T size;
++    BYTE *buffer;
++    DWORD status;
++    HRESULT hr;
++
++    *out = NULL;
++    *outCount = 0;
++    if (FAILED(hr = files_cloud_get( cloud, "", &status, &buffer, &size ))) return hr;
++    if (status == 404)
++    {
++        TRACE( "no connected storage for this title yet.\n" );
++        free( buffer );
++        return S_OK;
++    }
++    if (status != 200 || !buffer || !(blobs = json_find( (char *)buffer, "blobs" )) || *blobs != '[')
++    {
++        free( buffer );
++        return E_FAIL;
++    }
++    if ((paging = json_find( (char *)buffer, "pagingInfo" )) && (paging = json_find( paging, "continuationToken" )) && *paging == '"')
++        WARN( "container listing is paged, only the first page is synced.\n" );
++
++    for (item = json_ws( blobs + 1 ); *item == '{'; item = json_ws( item ))
++    {
++        const char *end = json_skip( item );
++        char *fileName = json_find_string( item, "fileName" ), *comma;
++        if (!end)
++        {
++            free( fileName );
++            break;
++        }
++        if (fileName && (comma = strstr( fileName, ",savedgame" )) && !comma[10])
++        {
++            *comma = 0;
++            if (!(tmp = realloc( remote, (count + 1) * sizeof(*remote) )))
++            {
++                free( fileName );
++                break;
++            }
++            remote = tmp;
++            remote[count].name = fileName;
++            remote[count].time = json_find_string( item, "clientFileTime" );
++            count++;
++            fileName = NULL;
++        }
++        free( fileName );
++        item = json_ws( end );
++        if (*item == ',') item++;
++    }
++    free( buffer );
++    *out = remote;
++    *outCount = count;
++    return S_OK;
++}
++
++static void files_cloud_download( XUserHandle user, const char *configurationId, const char *folder )
++{
++    static SRWLOCK lock = SRWLOCK_INIT;
++    static char synced[MAX_PATH];
++    struct XGameSaveProvider cloud = { 0 };
++    struct files_remote *remote = NULL;
++    enum files_sync_mode mode = files_sync_mode();
++    char backup[MAX_PATH] = { 0 }, dir[MAX_PATH], file[MAX_PATH];
++    UINT32 count = 0, downloaded = 0, skipped = 0, failed = 0;
++    BOOL verbose = files_verbose(), backedUp = FALSE;
++    HRESULT hr;
++
++    if (mode == FILES_SYNC_OFF)
++    {
++        TRACE( "XGameSaveFiles cloud sync disabled.\n" );
++        return;
++    }
++    if (!packageFamilyName)
++    {
++        WARN( "no package family name, XGameSaveFiles cloud sync skipped.\n" );
++        return;
++    }
++
++    /* once per folder per process: later calls must not redo it (or back up again) */
++    AcquireSRWLockExclusive( &lock );
++    if (!strcmp( synced, folder ))
++    {
++        ReleaseSRWLockExclusive( &lock );
++        return;
++    }
++    lstrcpynA( synced, folder, sizeof(synced) );
++
++    cloud.user = user;
++    snprintf( cloud.base, sizeof(cloud.base), "https://titlestorage.xboxlive.com/connectedstorage/users/xuid(%I64u)/scids/%s", xuser_get_xuid( user ), configurationId );
++    if (FAILED(hr = xuser_device_authorization( user, "http://xboxlive.com", &cloud.auth )))
++    {
++        ERR( "XGameSaveFiles cloud sync: authorization failed, hr %#lx, keeping local saves.\n", hr );
++        goto done;
++    }
++    if (FAILED(hr = files_list_remote( &cloud, &remote, &count )))
++    {
++        ERR( "XGameSaveFiles cloud sync: listing failed, hr %#lx, keeping local saves.\n", hr );
++        goto done;
++    }
++
++    for (UINT32 i = 0; i < count; i++)
++    {
++        struct files_blob *blobs;
++        UINT32 blobCount;
++        UINT64 remoteTime = parse_iso_time( remote[i].time ), localTime;
++        BOOL hasLocal, tooLong;
++        const char *reason;
++
++        if (!files_container_dir( folder, remote[i].name, dir, sizeof(dir) ))
++        {
++            WARN( "container %s cannot be mapped to a directory, skipped.\n", debugstr_a( remote[i].name ) );
++            skipped++;
++            continue;
++        }
++        hasLocal = files_local_newest( dir, &localTime );
++        if (!hasLocal) reason = "missing locally";
++        else if (mode == FILES_SYNC_FORCE_DOWNLOAD) reason = "forced by XODUS_SAVE_SYNC=download";
++        else if (!remoteTime) reason = NULL;
++        else if (remoteTime > localTime) reason = "cloud is newer";
++        else reason = NULL;
++
++        TRACE( "container %s: cloud time %s (%I64u), local newest %I64u, has local %d -> %s.\n", debugstr_a( remote[i].name ),
++               debugstr_a( remote[i].time ), remoteTime, localTime, hasLocal, reason ? reason : "keep local" );
++        if (verbose)
++            MESSAGE( "xodus-savefiles: %s cloud=%s local=%I64u -> %s\n", remote[i].name, remote[i].time ? remote[i].time : "-",
++                     hasLocal ? localTime : 0, reason ? reason : (remoteTime ? "keep local (local is newer)" : "keep local (cloud time unknown)") );
++        if (!reason)
++        {
++            skipped++;
++            continue;
++        }
++
++        if (FAILED(hr = files_fetch_container( &cloud, remote[i].name, &blobs, &blobCount )))
++        {
++            ERR( "container %s: download failed, hr %#lx, local copy left untouched.\n", debugstr_a( remote[i].name ), hr );
++            failed++;
++            continue;
++        }
++        if (!blobCount)
++        {
++            TRACE( "container %s is empty in the cloud, nothing to write.\n", debugstr_a( remote[i].name ) );
++            files_free_blobs( blobs, blobCount );
++            skipped++;
++            continue;
++        }
++        tooLong = FALSE;
++        for (UINT32 j = 0; j < blobCount; j++)
++            if (strlen( dir ) + 1 + strlen( blobs[j].name ) + 8 >= MAX_PATH) tooLong = TRUE;
++        if (tooLong)
++        {
++            WARN( "container %s: path too long under %s, skipped.\n", debugstr_a( remote[i].name ), debugstr_a( folder ) );
++            files_free_blobs( blobs, blobCount );
++            failed++;
++            continue;
++        }
++
++        if (!backedUp && files_folder_has_content( folder ))
++        {
++            if (!files_backup( folder, backup, sizeof(backup) ))
++            {
++                ERR( "could not back up %s to %s, aborting XGameSaveFiles cloud sync without writing anything.\n", debugstr_a( folder ), debugstr_a( backup ) );
++                files_free_blobs( blobs, blobCount );
++                failed++;
++                break;
++            }
++            WARN( "backed up %s to %s before downloading cloud saves.\n", debugstr_a( folder ), debugstr_a( backup ) );
++            if (verbose) MESSAGE( "xodus-savefiles: backup %s\n", backup );
++            backedUp = TRUE;
++        }
++
++        create_directories( dir );
++        hr = S_OK;
++        for (UINT32 j = 0; j < blobCount && SUCCEEDED(hr); j++)
++        {
++            snprintf( file, sizeof(file), "%s\\%s", dir, blobs[j].name );
++            if (FAILED(hr = write_file( file, blobs[j].data, blobs[j].size )))
++                ERR( "could not write %s, hr %#lx.\n", debugstr_a( file ), hr );
++            else TRACE( "wrote %s, %Iu bytes.\n", debugstr_a( file ), blobs[j].size );
++        }
++        if (SUCCEEDED(hr)) downloaded++;
++        else failed++;
++        files_free_blobs( blobs, blobCount );
++    }
++
++done:
++    TRACE( "XGameSaveFiles cloud sync of %s: %u containers, downloaded %u, kept local %u, failed %u, backup %s.\n",
++           debugstr_a( folder ), count, downloaded, skipped, failed, debugstr_a( backup ) );
++    if (verbose)
++        MESSAGE( "xodus-savefiles: containers %u downloaded %u kept-local %u failed %u backup %s\n", count, downloaded, skipped, failed, backup[0] ? backup : "-" );
++    for (UINT32 i = 0; i < count; i++)
++    {
++        free( remote[i].name );
++        free( remote[i].time );
++    }
++    free( remote );
++    free( cloud.auth );
++    ReleaseSRWLockExclusive( &lock );
++}
++
+ static HRESULT WINAPI save_async_provider( XAsyncOp op, const XAsyncProviderData *data )
+ {
+     struct save_async *ctx = data->context;
+@@ -1461,7 +1921,12 @@
+                     hr = submit_update( ctx->update );
+                     break;
+                 case ASYNC_FILES_FOLDER:
+-                    if (SUCCEEDED(hr = files_folder( ctx->user, ctx->text, &ctx->folder ))) size = strlen( ctx->folder ) + 1;
++                    if (SUCCEEDED(hr = files_folder( ctx->user, ctx->text, &ctx->folder )))
++                    {
++                        /* best effort: any failure keeps the local folder as is */
++                        files_cloud_download( ctx->user, ctx->text, ctx->folder );
++                        size = strlen( ctx->folder ) + 1;
++                    }
+                     break;
+             }
+             IXThreadingImpl_XAsyncComplete( xthreading, data->async, hr, SUCCEEDED(hr) ? size : 0 );
