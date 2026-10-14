@@ -1,0 +1,19 @@
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..4280b59e 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -17296,6 +17296,14 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
+ 	}
+ 	else if (storage == StorageClassStorageBuffer)
+ 	{
++		// IO composites that get flattened are declared as entry point locals (thread memory)
++		// and copied to/from the IO struct by fixup hooks. Even when outputs are captured to a
++		// device buffer, access to such a local is not device memory; treating it as such
++		// makes scalar component writes emit (device T*)&local, which Metal rejects.
++		if (find(begin(vars_needing_early_declaration), end(vars_needing_early_declaration), variable.self) !=
++		    end(vars_needing_early_declaration))
++			return false;
++
+ 		// These builtins are passed directly; we don't want to use remapping
+ 		// for them.
+ 		auto builtin = (BuiltIn)get_decoration(variable.self, DecorationBuiltIn);
