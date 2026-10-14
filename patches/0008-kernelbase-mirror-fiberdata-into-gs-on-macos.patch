@@ -1,0 +1,80 @@
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -882,8 +882,41 @@
+     LPFIBER_START_ROUTINE start;             /*       start routine */
+     void                 *fls_slots;         /*       fiber storage slots */
+     struct fiber_actctx   actctx;            /*       activation context state */
++    void                 *gs_saved;          /*       host value of %gs:0x20 before conversion */
+ };
++
++#ifdef __x86_64__
++/* Games commonly read the current fiber inline (MSVC GetCurrentFiber()/GetFiberData()
++ * are __readgsqword(0x20)). On macOS %gs is not the TEB but the pthread TSD base, and
++ * Wine only mirrors a few TEB fields there, so %gs:0x20 holds the thread's QoS class
++ * TSD slot instead of NtTib.FiberData and job systems switch to a garbage fiber.
++ * Mirror FiberData into %gs:0x20 for threads that use fibers. Where %gs is the TEB
++ * this is the very same memory, so it is a no-op. WINE_FIBER_GS_MIRROR=0 disables it. */
++static BOOL fiber_gs_mirror(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        char buf[4];
++        DWORD len = GetEnvironmentVariableA( "WINE_FIBER_GS_MIRROR", buf, sizeof(buf) );
++        enabled = !(len && len < sizeof(buf) && buf[0] == '0');
++    }
++    return enabled;
++}
++
++static inline void *get_gs_fiber_slot(void)
++{
++    void *value;
++    __asm__ volatile( "movq %%gs:0x20,%0" : "=r" (value) );
++    return value;
++}
+ 
++static inline void set_gs_fiber_slot( void *value )
++{
++    __asm__ volatile( "movq %0,%%gs:0x20" :: "r" (value) : "memory" );
++}
++#endif
++
+ #ifdef __i386__
+ extern void WINAPI switch_fiber( CONTEXT *old, CONTEXT *new );
+ __ASM_STDCALL_FUNC( switch_fiber, 8,
+@@ -1156,6 +1189,9 @@
+     {
+         relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+         NtCurrentTeb()->Tib.FiberData = NULL;
++#ifdef __x86_64__
++        if (fiber_gs_mirror()) set_gs_fiber_slot( fiber->gs_saved );
++#endif
+         HeapFree( GetProcessHeap(), 0, fiber );
+     }
+     return TRUE;
+@@ -1216,8 +1252,15 @@
+     fiber->start            = NULL;
+     fiber->flags            = flags;
+     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
++    fiber->gs_saved         = NULL;
+     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
++#ifdef __x86_64__
++    if (fiber_gs_mirror()) fiber->gs_saved = get_gs_fiber_slot();
++#endif
+     NtCurrentTeb()->Tib.FiberData = fiber;
++#ifdef __x86_64__
++    if (fiber_gs_mirror()) set_gs_fiber_slot( fiber );
++#endif
+     return fiber;
+ }
+ 
+@@ -1274,6 +1317,9 @@
+     NtCurrentTeb()->DeallocationStack = new_fiber->stack_allocation;
+     NtCurrentTeb()->FlsSlots          = new_fiber->fls_slots;
+     NtCurrentTeb()->ActivationContextStackPointer = new_fiber->actctx.stack_ptr;
++#ifdef __x86_64__
++    if (fiber_gs_mirror()) set_gs_fiber_slot( new_fiber );
++#endif
+     switch_fiber( &current_fiber->context, &new_fiber->context );
+ }
+ 
