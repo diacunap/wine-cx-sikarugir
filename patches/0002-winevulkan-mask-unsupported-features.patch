@@ -1,0 +1,66 @@
+--- a/dlls/winevulkan/loader.c
++++ b/dlls/winevulkan/loader.c
+@@ -627,6 +627,31 @@
+     status = UNIX_CALL(vkEnumerateInstanceVersion, &params);
+     assert(!status);
+     return params.result;
++}
++
++/* Sikarugir: some games (e.g. No Man's Sky) request core features MoltenVK can't
++ * provide (wideLines) and never check vkCreateDevice's result. With
++ * WINE_VK_MASK_UNSUPPORTED_FEATURES=1, drop unsupported VkPhysicalDeviceFeatures
++ * bits instead of failing with VK_ERROR_FEATURE_NOT_PRESENT. Opt-in on purpose. */
++static BOOL mask_unsupported_features_enabled(void)
++{
++    const char *env = getenv("WINE_VK_MASK_UNSUPPORTED_FEATURES");
++    return env && *env && *env != '0';
++}
++
++static void mask_unsupported_features(VkPhysicalDevice physical_device, VkPhysicalDeviceFeatures *features)
++{
++    VkPhysicalDeviceFeatures supported;
++    VkBool32 *want = (VkBool32 *)features, *have = (VkBool32 *)&supported;
++    uint32_t i;
++
++    vkGetPhysicalDeviceFeatures(physical_device, &supported);
++    for (i = 0; i < sizeof(*features) / sizeof(VkBool32); i++)
++    {
++        if (!want[i] || have[i]) continue;
++        WARN("masking unsupported VkPhysicalDeviceFeatures field %u\n", i);
++        want[i] = VK_FALSE;
++    }
+ }
+ 
+ VkResult WINAPI vkCreateDevice(VkPhysicalDevice physical_device, const VkDeviceCreateInfo *create_info,
+@@ -634,10 +659,31 @@
+ {
+     struct vulkan_device_extensions extensions = {0};
+     struct vkCreateDevice_params params;
++    VkDeviceCreateInfo masked_info;
++    VkPhysicalDeviceFeatures masked_features;
+     uint32_t queue_count = 0, i;
+     VkDevice device;
+     NTSTATUS status;
+ 
++    if (mask_unsupported_features_enabled())
++    {
++        VkBaseOutStructure *next;
++
++        masked_info = *create_info;
++        if (create_info->pEnabledFeatures)
++        {
++            masked_features = *create_info->pEnabledFeatures;
++            mask_unsupported_features(physical_device, &masked_features);
++            masked_info.pEnabledFeatures = &masked_features;
++        }
++        /* The pNext chain is app-owned and const; masking in place only clears
++         * bits the driver would reject anyway. */
++        for (next = (VkBaseOutStructure *)create_info->pNext; next; next = next->pNext)
++            if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
++                mask_unsupported_features(physical_device, &((VkPhysicalDeviceFeatures2 *)next)->features);
++        create_info = &masked_info;
++    }
++
+     TRACE("Enabling %u client device extensions\n", create_info->enabledExtensionCount);
+     for (uint32_t i = 0; i < create_info->enabledExtensionCount; i++)
+     {

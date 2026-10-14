@@ -87,4 +87,8 @@ for knob in WINE_SIMULATE_WRITECOPY CX_APPLEGPTK_LIBD3DSHARED_PATH WINEDLLPATH_D
     grep -qa "$knob" "$INSTALL/lib/wine/x86_64-unix/ntdll.so" \
         || { echo "ntdll.so lacks $knob: missing CrossOver sources or patches/?" >&2; exit 1; }
 done
+grep -qa WINE_VK_MASK_UNSUPPORTED_FEATURES "$INSTALL/lib/wine/x86_64-windows/winevulkan.dll" \
+    || { echo "winevulkan.dll lacks the feature-masking patch (patches/0002)" >&2; exit 1; }
+[ -f "$INSTALL/lib/wine/x86_64-windows/xgameruntime.dll" ] \
+    || { echo "xgameruntime.dll missing (patches/0004)" >&2; exit 1; }
 echo "wine installed at $INSTALL"
